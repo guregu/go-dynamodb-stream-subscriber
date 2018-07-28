@@ -4,13 +4,14 @@ package stream
 
 import (
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
-	"sync"
+	"github.com/cenkalti/backoff"
 )
 
 const SleepTime = 1 * time.Second
@@ -23,11 +24,12 @@ type StreamSubscriber struct {
 	Limit             *int64
 }
 
-func NewStreamSubscriber(
-	dynamoSvc *dynamodb.DynamoDB,
-	streamSvc *dynamodbstreams.DynamoDBStreams,
-	table string) *StreamSubscriber {
-	s := &StreamSubscriber{dynamoSvc: dynamoSvc, streamSvc: streamSvc, table: &table}
+func NewStreamSubscriber(dynamoSvc *dynamodb.DynamoDB, streamSvc *dynamodbstreams.DynamoDBStreams, table string) *StreamSubscriber {
+	s := &StreamSubscriber{
+		dynamoSvc: dynamoSvc,
+		streamSvc: streamSvc,
+		table:     &table,
+	}
 	s.applyDefaults()
 	return s
 }
@@ -57,6 +59,9 @@ func (r *StreamSubscriber) GetStreamData() (<-chan *dynamodbstreams.Record, <-ch
 		var streamArn *string
 		var err error
 
+		boff := backoff.NewExponentialBackOff()
+		boff.InitialInterval = SleepTime
+		boff.MaxInterval = SleepTime * 5
 		for {
 			prevShardId = shardId
 			shardId, streamArn, err = r.findProperShardId(prevShardId)
@@ -72,7 +77,10 @@ func (r *StreamSubscriber) GetStreamData() (<-chan *dynamodbstreams.Record, <-ch
 				}
 			}
 			if shardId == nil {
-				time.Sleep(SleepTime)
+				delay := boff.NextBackOff()
+				time.Sleep(delay)
+			} else {
+				boff.Reset()
 			}
 
 		}
@@ -230,7 +238,9 @@ func (r *StreamSubscriber) processShard(input *dynamodbstreams.GetShardIteratorI
 	}
 
 	nextIterator := iter.ShardIterator
-
+	boff := backoff.NewExponentialBackOff()
+	boff.MaxInterval = SleepTime
+	boff.InitialInterval = SleepTime / 4
 	for nextIterator != nil {
 		recs, err := r.streamSvc.GetRecords(&dynamodbstreams.GetRecordsInput{
 			ShardIterator: nextIterator,
@@ -248,19 +258,17 @@ func (r *StreamSubscriber) processShard(input *dynamodbstreams.GetShardIteratorI
 		for _, record := range recs.Records {
 			ch <- record
 		}
+		if len(recs.Records) > 0 {
+			boff.Reset()
+		}
 
 		nextIterator = recs.NextShardIterator
 
-		sleepDuration := time.Second
-
+		sleepDuration := boff.NextBackOff()
 		// Nil next itarator, shard is closed
 		if nextIterator == nil {
 			sleepDuration = time.Millisecond * 10
-		} else if len(recs.Records) == 0 {
-			// Empty set, but shard is not closed -> sleep a little
-			sleepDuration = SleepTime
 		}
-
 		time.Sleep(sleepDuration)
 	}
 	return nil
